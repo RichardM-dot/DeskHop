@@ -1,0 +1,461 @@
+/*
+ * This file is part of DeskHop (https://github.com/hrvach/deskhop).
+ * Copyright (c) 2025 Hrvoje Cavrak
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, version 3.
+ *
+ * See the file LICENSE for the full license text.
+ */
+
+/*
+ * ============================================================================
+ * 【中文导读】keyboard.c —— 键盘报文处理 + 全局热键系统
+ * ----------------------------------------------------------------------------
+ * 本文件做什么：
+ *   1. 热键表 hotkeys[]：全部快捷功能（切机/慢速鼠标/锁切换/游戏模式/屏保/
+ *      配置模式/固件升级）都在这张表里声明——组合键、是否透传给系统、
+ *      触发后是否闪灯。加新功能=加一行，无需改逻辑（数据驱动设计典范）。
+ *   2. 多键盘状态合并：可能同时插多个键盘+对端还发来一个键盘，
+ *      combine_kbd_states() 把所有 6KRO 报文按位或合并成一份再上报。
+ *   3. 报文分流：send_key() 决定键盘数据"发给本机 USB"还是"经 UART 给对端"。
+ *
+ * 精读点：process_keyboard_report() 的处理顺序——先提取→更新状态→查热键
+ * （热键可以决定不透传）→合并上报。
+ * ============================================================================
+ */
+
+#include "main.h"
+
+/* ==================================================== *
+ * Hotkeys to trigger actions via the keyboard.
+ * ==================================================== */
+
+/* 全局热键定义表（数据驱动：每条=修饰键+按键序列+处理函数+策略标志） */
+hotkey_combo_t hotkeys[] = {
+    /* Main keyboard switching hotkey */
+    {.modifier       = HOTKEY_MODIFIER,
+     .keys           = {HOTKEY_TOGGLE},
+     .key_count      = 1,
+     .pass_to_os     = false,
+     .action_handler = &output_toggle_hotkey_handler},
+
+    /* Pressing right ALT + right CTRL toggles the slow mouse mode */
+    {.modifier       = KEYBOARD_MODIFIER_RIGHTALT | KEYBOARD_MODIFIER_RIGHTCTRL,
+     .keys           = {},
+     .key_count      = 0,
+     .pass_to_os     = true,
+     .acknowledge    = true,
+     .action_handler = &mouse_zoom_hotkey_handler},
+
+    /* Switch lock */
+    {.modifier       = KEYBOARD_MODIFIER_RIGHTCTRL,
+     .keys           = {HID_KEY_K},
+     .key_count      = 1,
+     .acknowledge    = true,
+     .action_handler = &switchlock_hotkey_handler},
+
+    /* Screen lock */
+    {.modifier       = KEYBOARD_MODIFIER_RIGHTCTRL,
+     .keys           = {HID_KEY_L},
+     .key_count      = 1,
+     .acknowledge    = true,
+     .action_handler = &screenlock_hotkey_handler},
+
+    /* Toggle gaming mode */
+    {.modifier       = KEYBOARD_MODIFIER_LEFTCTRL | KEYBOARD_MODIFIER_RIGHTSHIFT,
+     .keys           = {HID_KEY_G},
+     .key_count      = 1,
+     .acknowledge    = true,
+     .action_handler = &toggle_gaming_mode_handler},
+
+    /* Enable screensaver pong for active output */
+    {.modifier       = KEYBOARD_MODIFIER_LEFTCTRL | KEYBOARD_MODIFIER_RIGHTSHIFT,
+     .keys           = {HID_KEY_S},
+     .key_count      = 1,
+     .acknowledge    = true,
+     .action_handler = &enable_screensaver_pong_hotkey_handler},
+
+    /* Enable screensaver jitter for active output */
+    {.modifier       = KEYBOARD_MODIFIER_LEFTCTRL | KEYBOARD_MODIFIER_RIGHTSHIFT,
+     .keys           = {HID_KEY_J},
+     .key_count      = 1,
+     .acknowledge    = true,
+     .action_handler = &enable_screensaver_jitter_hotkey_handler},
+
+    /* Disable screensaver for active output */
+    {.modifier       = KEYBOARD_MODIFIER_LEFTCTRL | KEYBOARD_MODIFIER_RIGHTSHIFT,
+     .keys           = {HID_KEY_X},
+     .key_count      = 1,
+     .acknowledge    = true,
+     .action_handler = &disable_screensaver_hotkey_handler},
+
+    /* Erase stored config */
+    {.modifier       = KEYBOARD_MODIFIER_RIGHTSHIFT,
+     .keys           = {HID_KEY_F12, HID_KEY_D},
+     .key_count      = 2,
+     .acknowledge    = true,
+     .action_handler = &wipe_config_hotkey_handler},
+
+    /* Record switch y coordinate  */
+    {.modifier       = KEYBOARD_MODIFIER_RIGHTSHIFT,
+     .keys           = {HID_KEY_F12, HID_KEY_Y},
+     .key_count      = 2,
+     .acknowledge    = true,
+     .action_handler = &screen_border_hotkey_handler},
+
+    /* Switch to configuration mode  */
+    {.modifier       = KEYBOARD_MODIFIER_LEFTCTRL | KEYBOARD_MODIFIER_RIGHTSHIFT,
+     .keys           = {HID_KEY_C, HID_KEY_O},
+     .key_count      = 2,
+     .acknowledge    = true,
+     .action_handler = &config_enable_hotkey_handler},
+
+    /* Hold down left shift + right shift + F12 + A ==> firmware upgrade mode for board A (kbd) */
+    {.modifier       = KEYBOARD_MODIFIER_RIGHTSHIFT | KEYBOARD_MODIFIER_LEFTSHIFT,
+     .keys           = {HID_KEY_A},
+     .key_count      = 1,
+     .acknowledge    = true,
+     .action_handler = &fw_upgrade_hotkey_handler_A},
+
+    /* Hold down left shift + right shift + F12 + B ==> firmware upgrade mode for board B (mouse) */
+    {.modifier       = KEYBOARD_MODIFIER_RIGHTSHIFT | KEYBOARD_MODIFIER_LEFTSHIFT,
+     .keys           = {HID_KEY_B},
+     .key_count      = 1,
+     .acknowledge    = true,
+     .action_handler = &fw_upgrade_hotkey_handler_B}};
+
+/* ============================================================ *
+ * Detect if any hotkeys were pressed
+ * ============================================================ */
+
+/* 报文里是否包含某个键码（扫 6 个键码槽） */
+/* Tries to find if the keyboard report contains key, returns true/false */
+bool key_in_report(uint8_t key, const hid_keyboard_report_t *report) {
+    for (int j = 0; j < KEYS_IN_USB_REPORT; j++) {
+        if (key == report->keycode[j]) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/* 单条热键匹配：修饰键全部按下 且 键序列都在报文里才算命中 */
+/* Check if the current report matches a specific hotkey passed on */
+bool check_specific_hotkey(hotkey_combo_t keypress, const hid_keyboard_report_t *report) {
+    /* We expect all modifiers specified to be detected in the report */
+    if (keypress.modifier != (report->modifier & keypress.modifier))
+        return false;
+
+    for (int n = 0; n < keypress.key_count; n++) {
+        if (!key_in_report(keypress.keys[n], report)) {
+            return false;
+        }
+    }
+
+    /* Getting here means all of the keys were found. */
+    return true;
+}
+
+/* Go through the list of hotkeys, check if any of them match. */
+hotkey_combo_t *check_all_hotkeys(hid_keyboard_report_t *report, device_t *state) {
+    for (int n = 0; n < ARRAY_SIZE(hotkeys); n++) {
+        if (check_specific_hotkey(hotkeys[n], report)) {
+            return &hotkeys[n];
+        }
+    }
+
+    return NULL;
+}
+
+/* ==================================================== *
+ * Keyboard State Management
+ * ==================================================== */
+
+/* 记录"本机第 device_idx 个接口"的最新键盘状态（供多键盘合并用） */
+/* Update the keyboard state for a specific device */
+void update_kbd_state(device_t *state, hid_keyboard_report_t *report, uint8_t device_idx) {
+    /* Ensure device_idx is within bounds */
+    if (device_idx >= MAX_DEVICES)
+        return;
+
+    /* Update the keyboard state for this device */
+    memcpy(&state->local_kbd_states[device_idx], report, sizeof(hid_keyboard_report_t));
+
+    /* Track the largest keyboard index we have */
+    if (state->max_kbd_idx < device_idx)
+        state->max_kbd_idx = device_idx;
+}
+
+/* Update the struct storing the state of the keyboard(s) connected to the other board */
+void update_remote_kbd_state(device_t *state, hid_keyboard_report_t *report) {
+    memcpy(&state->remote_kbd_state, report, sizeof(hid_keyboard_report_t));
+}
+
+/* 键码合并：把 src 的键码塞进 dest 的空槽（去重，6KRO 槽位有限） */
+/* Add keys from source to destination, avoiding duplicates */
+static void add_keys(hid_keyboard_report_t *dest, const hid_keyboard_report_t *src) {
+    for (uint8_t i = 0; i < KEYS_IN_USB_REPORT; i++) {
+        uint8_t key = src->keycode[i];
+        
+        if (key == 0 || key_in_report(key, dest))
+            continue;
+            
+        uint8_t *empty_slot = memchr(dest->keycode, 0, KEYS_IN_USB_REPORT);
+        if (empty_slot)
+            *empty_slot = key;
+    }
+}
+
+/* 释放全部按键：清空所有状态记忆并发一份全零报文（切换输出时必须做，
+ * 否则旧电脑上的按键状态会"卡住"） */
+/* Release all keys */
+void release_all_keys(device_t *state) {
+    memset(state->local_kbd_states, 0, sizeof(state->local_kbd_states));
+    memset(&state->remote_kbd_state, 0, sizeof(hid_keyboard_report_t));
+    
+    static hid_keyboard_report_t empty_report = {0};
+    queue_kbd_report(&empty_report, state);
+}
+
+
+/* 多键盘合并：本机所有键盘接口 + 对端发来的键盘 → 一份组合报文（修饰键按位或） */
+/* Combine all keyboard states into a single report */
+void combine_kbd_states(device_t *state, hid_keyboard_report_t *combined_report) {
+    memset(combined_report, 0, sizeof(hid_keyboard_report_t));
+
+    /* Combine all local keyboards up to max_kbd_idx */
+    for (uint8_t i = 0; i <= state->max_kbd_idx; i++) {
+        combined_report->modifier |= state->local_kbd_states[i].modifier;
+        add_keys(combined_report, &state->local_kbd_states[i]);
+    }
+    
+    /* Add remote keyboard */
+    combined_report->modifier |= state->remote_kbd_state.modifier;
+    add_keys(combined_report, &state->remote_kbd_state);
+}
+
+/* ==================================================== *
+ * Keyboard Queue Section
+ * ==================================================== */
+
+/* 按当前协议模式发键盘报文（boot 协议无 report id，report 协议要带 id） */
+static bool send_keyboard_report(hid_keyboard_report_t *report) {
+    /* Boot protocol uses the 8-byte keyboard report without a report ID. */
+    if (tud_hid_n_get_protocol(ITF_NUM_HID) == HID_PROTOCOL_BOOT)
+        return tud_hid_n_report(ITF_NUM_HID, 0, report, sizeof(*report));
+
+    /* Otherwise, use the report ID for the keyboard interface */
+    return tud_hid_keyboard_report(REPORT_ID_KEYBOARD, report->modifier, report->keycode);
+}
+
+void process_kbd_queue_task(device_t *state) {
+    hid_keyboard_report_t report;
+
+    /* If we're not connected, we have nowhere to send reports to. */
+    if (!state->tud_connected)
+        return;
+
+    /* Peek first, if there is anything there... */
+    if (!queue_try_peek(&state->kbd_queue, &report))
+        return;
+
+    /* If we are suspended, let's wake the host up */
+    if (tud_suspended())
+        tud_remote_wakeup();
+
+    /* If it's not ok to send yet, we'll try on the next pass */
+    if (!tud_hid_n_ready(ITF_NUM_HID))
+        return;
+
+    bool succeeded = send_keyboard_report(&report);
+
+    /* ... then we can remove it from the queue. Race conditions shouldn't happen [tm] */
+    if (succeeded)
+        queue_try_remove(&state->kbd_queue, &report);
+}
+
+void queue_kbd_report(hid_keyboard_report_t *report, device_t *state) {
+    /* It wouldn't be fun to queue up a bunch of messages and then dump them all on host */
+    if (!state->tud_connected)
+        return;
+
+    queue_try_add(&state->kbd_queue, report);
+}
+
+/* 键盘数据分流：本机是活跃输出→本地 USB；否则 UART 打包发给对端板 */
+/* If keys need to go locally, queue packet to kbd queue, else send them through UART */
+void send_key(hid_keyboard_report_t *report, device_t *state) {
+    /* Create a combined report from all device states */
+    hid_keyboard_report_t combined_report;
+    combine_kbd_states(state, &combined_report);
+
+    if (CURRENT_BOARD_IS_ACTIVE_OUTPUT) {
+        /* Queue the combined report */
+        queue_kbd_report(&combined_report, state);
+        state->last_activity[BOARD_ROLE] = time_us_64();
+    } else {
+        /* Send the combined report to ensure all keys are included */
+        queue_packet((uint8_t *)&combined_report, KEYBOARD_REPORT_MSG, KBD_REPORT_LENGTH);
+    }
+}
+
+/* Decide if consumer control reports go local or to the other board */
+void send_consumer_control(uint8_t *raw_report, device_t *state) {
+    if (CURRENT_BOARD_IS_ACTIVE_OUTPUT) {
+        queue_cc_packet(raw_report, state);
+        state->last_activity[BOARD_ROLE] = time_us_64();
+    } else {
+        queue_packet((uint8_t *)raw_report, CONSUMER_CONTROL_MSG, CONSUMER_CONTROL_LENGTH);
+    }
+}
+
+/* Decide if consumer control reports go local or to the other board */
+void send_system_control(uint8_t *raw_report, device_t *state) {
+    if (CURRENT_BOARD_IS_ACTIVE_OUTPUT) {
+        queue_system_packet(raw_report, state);
+        state->last_activity[BOARD_ROLE] = time_us_64();
+    } else {
+        queue_packet((uint8_t *)raw_report, SYSTEM_CONTROL_MSG, SYSTEM_CONTROL_LENGTH);
+    }
+}
+
+/* ==================================================== *
+ * Parse and interpret the keys pressed on the keyboard
+ * ==================================================== */
+
+/*
+ * 键盘报文处理主入口：提取→记状态→查热键→（热键可拦截不透传）→合并分流。
+ * 即将重启时拒绝新按键，避免升级过程中误触发任何操作。
+ */
+void process_keyboard_report(uint8_t *raw_report, int length, uint8_t itf, hid_interface_t *iface) {
+    hid_keyboard_report_t new_report = {0};
+    device_t *state                  = &global_state;
+    hotkey_combo_t *hotkey           = NULL;
+
+    if (length < KBD_REPORT_LENGTH)
+        return;
+
+    /* No more keys accepted if we're about to reboot */
+    if (global_state.reboot_requested)
+        return;
+
+    extract_kbd_data(raw_report, length, itf, iface, &new_report);
+
+    /* Update the keyboard state for this device */
+    update_kbd_state(state, &new_report, itf);
+
+    /* Check if any hotkey was pressed */
+    hotkey = check_all_hotkeys(&new_report, state);
+
+    /* ... and take appropriate action */
+    if (hotkey != NULL) {
+        /* Provide visual feedback we received the action */
+        if (hotkey->acknowledge)
+            blink_led(state);   /* 闪灯确认：告诉用户热键已被识别 */
+
+        /* Execute the corresponding handler */
+        hotkey->action_handler(state, &new_report);   /* 执行热键动作（切机/锁/升级…） */
+
+        /* And pass the key to the output PC if configured to do so. */
+        if (!hotkey->pass_to_os)
+            return;   /* 该热键不透传（如切机键），到此为止 */
+    }
+
+    /* This method will decide if the key gets queued locally or sent through UART */
+    send_key(&new_report, state);
+}
+
+void process_consumer_report(uint8_t *raw_report, int length, uint8_t itf, hid_interface_t *iface) {
+    /* Consumer interfaces may omit the report ID. */
+    int data_len = length - iface->uses_report_id;
+
+    if (data_len <= 0)
+        return;
+
+    uint8_t *data = raw_report + iface->uses_report_id;
+    uint8_t new_report[CONSUMER_CONTROL_LENGTH] = {0};
+    uint16_t *report_ptr = (uint16_t *)new_report;
+    device_t *state = &global_state;
+    keyboard_t *keyboard = get_keyboard(iface, raw_report[0]);
+
+    /* If consumer control is variable, read the values from cc_array and send as array. */
+    if (iface->consumer.is_variable) {
+        for (int i = 0; i < MAX_CC_BUTTONS && i < 8 * data_len; i++) {
+            int bit_idx = i % 8;
+            int byte_idx = i >> 3;
+
+            if ((data[byte_idx] >> bit_idx) & 1) {
+                report_ptr[0] = keyboard->cc_array[i];
+            }
+        }
+    }
+    else {
+        for (int i = 0; i < data_len && i < CONSUMER_CONTROL_LENGTH; i++)
+            new_report[i] = data[i];
+    }
+
+    if (CURRENT_BOARD_IS_ACTIVE_OUTPUT) {
+        send_consumer_control(new_report, state);
+    } else {
+        queue_packet((uint8_t *)new_report, CONSUMER_CONTROL_MSG, CONSUMER_CONTROL_LENGTH);
+    }
+}
+
+void process_system_report(uint8_t *raw_report, int length, uint8_t itf, hid_interface_t *iface) {
+    int data_len = length - iface->uses_report_id;
+
+    if (data_len < SYSTEM_CONTROL_LENGTH)
+        return;
+
+    uint8_t *data = raw_report + iface->uses_report_id;
+    uint16_t new_report = data[0];
+    uint8_t *report_ptr = (uint8_t *)&new_report;
+    device_t *state = &global_state;
+
+    if (CURRENT_BOARD_IS_ACTIVE_OUTPUT) {
+        send_system_control(report_ptr, state);
+    } else {
+        queue_packet(report_ptr, SYSTEM_CONTROL_MSG, SYSTEM_CONTROL_LENGTH);
+    }
+}
+
+/* 按 report id 找键盘实例；找不到回落主键盘（容错） */
+/* Look up a registered report ID, falling back to the primary keyboard if unknown. */
+keyboard_t *get_keyboard(hid_interface_t *iface, uint8_t report_id) {
+    if (!iface->uses_report_id)
+        return &iface->keyboards[PRIMARY_KEYBOARD];
+
+    for (int i = 0; i < iface->num_keyboards && i < MAX_KEYBOARDS; i++) {
+        if (iface->keyboards[i].report_id == report_id)
+            return &iface->keyboards[i];
+    }
+
+    /* If nothing else is matched, return the primary keyboard. */
+    return &iface->keyboards[PRIMARY_KEYBOARD];
+}
+
+/* Parse-time counterpart: return the next free slot for an unseen report ID. The caller
+    commits that slot by increasing num_keyboards after processing a descriptor value. */
+/* 解析期版本：未见过的 report id 就分配新键盘槽位（一个接口可带多个键盘） */
+keyboard_t *get_or_add_keyboard(hid_interface_t *iface, uint8_t report_id) {
+    if (!iface->uses_report_id)
+        return &iface->keyboards[PRIMARY_KEYBOARD];
+
+    for (int i = 0; i < iface->num_keyboards && i < MAX_KEYBOARDS; i++) {
+        if (iface->keyboards[i].report_id == report_id)
+            return &iface->keyboards[i];
+    }
+
+    if (iface->num_keyboards >= MAX_KEYBOARDS)
+        return &iface->keyboards[PRIMARY_KEYBOARD];
+
+    keyboard_t *kb = &iface->keyboards[iface->num_keyboards];
+
+    kb->report_id      = report_id;
+    kb->uses_report_id = true;
+
+    return kb;
+}
